@@ -1,3 +1,11 @@
 [theme]
-base="light"
-primaryColor="#2563eb"
+base="dark"
+primaryColor="#f5576c"
+backgroundColor="#667eea"
+secondaryBackgroundColor="#764ba2"
+textColor="#ffffff"
+
+[server]
+headless = true
+enableCORS = false
+port = 8501
