@@ -4,7 +4,8 @@ Real-time heart rate detection using Remote Photoplethysmography (rPPG) technolo
 
 ## 🎯 Features
 
-- **Live Video Processing**: Real-time webcam heart rate detection
+- **Video Upload Processing**: Upload videos for heart rate analysis (Cloud-compatible)
+- **Live Webcam Mode**: Real-time detection (Local deployment only)
 - **Dual Detection Methods**:
   - Classical signal processing (FFT & Welch PSD)
   - Deep learning (TinyRPPGNet 3D CNN)
@@ -13,7 +14,15 @@ Real-time heart rate detection using Remote Photoplethysmography (rPPG) technolo
 
 ## 🚀 Live Demo
 
-[![Streamlit App](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://your-app-name.streamlit.app)
+Try it now: **[Launch App](https://your-app-name.streamlit.app)** *(Update after deployment)*
+
+## 📂 Files
+
+- `streamlit_app.py` - Main app (video upload, cloud-compatible)
+- `streamlit_app_local.py` - Local webcam version
+- `app.py` - OpenCV standalone version
+- `tiny_rppgnet.py` - Deep learning model
+- `rppg_core.py` - Signal processing utilities
 
 ## 🔬 Technology Stack
 
@@ -39,6 +48,17 @@ streamlit run streamlit_app.py
 
 ## 💻 Usage
 
+### Cloud Version (Video Upload)
+1. Visit the deployed app URL
+2. Click **"Upload a video of your face"**
+3. Select a video file (MP4, AVI, MOV, etc.)
+4. Click **"Analyze Heart Rate"**
+5. View results and signal visualization
+
+### Local Version (Live Webcam)
+```bash
+streamlit run streamlit_app_local.py
+```
 1. Click **"Start Live Detection"** button
 2. Position your face in front of the camera
 3. Stay still for best results (5-10 seconds)

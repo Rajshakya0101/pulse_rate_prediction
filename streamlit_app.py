@@ -3,7 +3,9 @@ import cv2
 import numpy as np
 import mediapipe as mp
 import torch
+import tempfile
 import time
+from pathlib import Path
 from collections import deque
 
 from tiny_rppgnet import TinyRPPGNet
@@ -11,7 +13,7 @@ from rppg_core import bandpass_filter, bpm_from_welch_harmonic
 
 # Page configuration
 st.set_page_config(
-    page_title="Live Pulse Rate Monitor",
+    page_title="Pulse Rate Monitor - Cloud",
     page_icon="❤️",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -41,14 +43,6 @@ st.markdown("""
         transform: translateY(-3px);
         box-shadow: 0 12px 20px rgba(0, 0, 0, 0.4);
     }
-    .metric-card {
-        background: rgba(255, 255, 255, 0.1);
-        backdrop-filter: blur(10px);
-        border-radius: 20px;
-        padding: 20px;
-        box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
-        border: 1px solid rgba(255, 255, 255, 0.2);
-    }
     h1 {
         color: white;
         text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.3);
@@ -63,32 +57,24 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # Initialize session state
-if 'running' not in st.session_state:
-    st.session_state.running = False
-if 'stop_requested' not in st.session_state:
-    st.session_state.stop_requested = False
 if 'model_loaded' not in st.session_state:
     st.session_state.model_loaded = False
 if 'model' not in st.session_state:
     st.session_state.model = None
 
+@st.cache_resource
 def load_model():
-    """Load the TinyRPPGNet model"""
-    if not st.session_state.model_loaded:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        model = TinyRPPGNet().to(device)
-        try:
-            state = torch.load("models/tiny_rppgnet_best.pth", map_location=device)
-            model.load_state_dict(state)
-            model.eval()
-            st.session_state.model = model
-            st.session_state.device = device
-            st.session_state.model_loaded = True
-            return True, device
-        except Exception as e:
-            st.error(f"Error loading model: {e}")
-            return False, None
-    return True, st.session_state.device
+    """Load the TinyRPPGNet model (cached)"""
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = TinyRPPGNet().to(device)
+    try:
+        state = torch.load("models/tiny_rppgnet_best.pth", map_location=device)
+        model.load_state_dict(state)
+        model.eval()
+        return model, device
+    except Exception as e:
+        st.error(f"Error loading model: {e}")
+        return None, None
 
 def get_forehead_bbox_from_landmarks(landmarks, w, h, scale=1.05, frac=0.35):
     """Extract forehead bounding box from face landmarks"""
@@ -114,24 +100,23 @@ def get_forehead_bbox_from_landmarks(landmarks, w, h, scale=1.05, frac=0.35):
     y2_new = y1 + int(h_box * frac)
     return x1, y1, x2, max(y1 + 1, y2_new)
 
-def run_live_detection():
-    """Run live video detection with real-time heart rate updates"""
+def process_video(video_path, progress_bar, status_text):
+    """Process uploaded video for heart rate detection"""
     
-    success, device = load_model()
-    if not success:
-        return
+    model, device = load_model()
+    if model is None:
+        return None, None, None, None
     
-    model = st.session_state.model
-    
-    cap = cv2.VideoCapture(0)
+    cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        st.error("❌ Could not access webcam. Please check your camera permissions.")
-        st.session_state.running = False
-        return
+        st.error("❌ Could not open video file.")
+        return None, None, None, None
     
     fps = cap.get(cv2.CAP_PROP_FPS)
     if fps <= 0 or np.isnan(fps):
         fps = 30.0
+    
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     
     roi_size = (36, 36)
     clip_len = 128
@@ -140,17 +125,8 @@ def run_live_detection():
     
     mp_face_mesh = mp.solutions.face_mesh
     
-    # Create placeholders for UI elements
-    video_placeholder = st.empty()
-    col1, col2 = st.columns(2)
-    metric_classic = col1.empty()
-    metric_tiny = col2.empty()
-    status_placeholder = st.empty()
-    
-    # Stop button outside the loop
-    stop_col1, stop_col2, stop_col3 = st.columns([1, 2, 1])
-    with stop_col2:
-        stop_button = st.button("⏹️ Stop Live Detection", type="secondary", use_container_width=True, key="stop_live")
+    frame_count = 0
+    sample_frames = []
     
     with mp_face_mesh.FaceMesh(
         static_image_mode=False,
@@ -160,15 +136,7 @@ def run_live_detection():
         min_tracking_confidence=0.5,
     ) as face_mesh:
         
-        frame_count = 0
-        start_time = time.time()
-        
-        while st.session_state.running:
-            # Check if stop button was clicked
-            if stop_button:
-                st.session_state.running = False
-                break
-            
+        while True:
             ok, frame_bgr = cap.read()
             if not ok:
                 break
@@ -177,7 +145,6 @@ def run_live_detection():
             h, w = frame_rgb.shape[:2]
             
             results = face_mesh.process(frame_rgb)
-            face_detected = False
             
             if results.multi_face_landmarks:
                 lms = results.multi_face_landmarks[0]
@@ -186,7 +153,6 @@ def run_live_detection():
                 x2 = min(w - 1, x2); y2 = min(h - 1, y2)
                 
                 if x2 > x1 and y2 > y1:
-                    face_detected = True
                     roi = frame_rgb[y1:y2, x1:x2]
                     roi_resized = cv2.resize(roi, roi_size)
                     
@@ -195,132 +161,220 @@ def run_live_detection():
                     g_val = roi_resized[:, :, 1].mean()
                     trace_buffer.append(g_val)
                     
-                    # Draw rectangle and status
-                    cv2.rectangle(frame_bgr, (x1, y1), (x2, y2), (0, 255, 0), 3)
-                    cv2.putText(frame_bgr, "Face Detected", (10, 35),
-                              cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+                    # Save sample frames with overlay
+                    if frame_count % 30 == 0:  # Save every 30th frame
+                        cv2.rectangle(frame_bgr, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                        sample_frames.append(frame_bgr)
             
-            if not face_detected:
-                cv2.putText(frame_bgr, "No Face Detected", (10, 35),
-                          cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
-            
-            # Calculate heart rates periodically
-            if frame_count % 15 == 0 and len(trace_buffer) > 64:  # Update every 15 frames
-                # Classical method
-                bpm_classic = float("nan")
-                try:
-                    trace = np.array(list(trace_buffer), dtype=np.float32)
-                    trace_f = bandpass_filter(trace, fs=fps, low=0.7, high=4.0)
-                    bpm_classic = bpm_from_welch_harmonic(trace_f, fs=fps)
-                except Exception as e:
-                    pass
-                
-                # TinyRPPGNet method
-                bpm_tiny = float("nan")
-                if len(roi_buffer) >= clip_len:
-                    try:
-                        clip = np.stack(list(roi_buffer)[-clip_len:], axis=0)
-                        x = torch.from_numpy(clip).float() / 255.0
-                        x = x.permute(3, 0, 1, 2).unsqueeze(0).to(device)
-                        with torch.no_grad():
-                            bpm_tiny = model(x).cpu().item()
-                    except Exception as e:
-                        pass
-                
-                # Update metrics
-                if np.isfinite(bpm_classic):
-                    metric_classic.metric("🔵 Classical Method", f"{bpm_classic:.1f} BPM")
-                    cv2.putText(frame_bgr, f"Classic: {bpm_classic:.1f} BPM", (10, h - 50),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
-                else:
-                    metric_classic.metric("🔵 Classical Method", "Collecting data...")
-                
-                if np.isfinite(bpm_tiny):
-                    metric_tiny.metric("🟣 TinyRPPGNet", f"{bpm_tiny:.1f} BPM")
-                    cv2.putText(frame_bgr, f"TinyRPPG: {bpm_tiny:.1f} BPM", (10, h - 15),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 255), 2)
-                else:
-                    metric_tiny.metric("🟣 TinyRPPGNet", "Collecting data...")
-            
-            # Add FPS and buffer info
-            elapsed = time.time() - start_time
-            fps_actual = frame_count / elapsed if elapsed > 0 else 0
-            cv2.putText(frame_bgr, f"FPS: {fps_actual:.1f} | Frames: {len(roi_buffer)}/{clip_len}", 
-                       (w - 350, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-            
-            # Display frame
-            video_placeholder.image(frame_bgr, channels="BGR", use_container_width=True)
-            
+            # Update progress
             frame_count += 1
-            
-            # Small delay to control frame rate
-            time.sleep(0.033)  # ~30 FPS
+            if total_frames > 0:
+                progress = min(frame_count / total_frames, 1.0)
+                progress_bar.progress(progress)
+                status_text.text(f"⏱️ Processing: Frame {frame_count}/{total_frames}")
     
     cap.release()
-    st.session_state.running = False
-    status_placeholder.success("✅ Live detection stopped")
+    
+    # Calculate heart rates
+    bpm_classic = float("nan")
+    if len(trace_buffer) > 64:
+        try:
+            trace = np.array(list(trace_buffer), dtype=np.float32)
+            trace_f = bandpass_filter(trace, fs=fps, low=0.7, high=4.0)
+            bpm_classic = bpm_from_welch_harmonic(trace_f, fs=fps)
+        except:
+            pass
+    
+    bpm_tiny = float("nan")
+    if len(roi_buffer) >= clip_len:
+        try:
+            clip = np.stack(list(roi_buffer)[-clip_len:], axis=0)
+            x = torch.from_numpy(clip).float() / 255.0
+            x = x.permute(3, 0, 1, 2).unsqueeze(0).to(device)
+            with torch.no_grad():
+                bpm_tiny = model(x).cpu().item()
+        except:
+            pass
+    
+    return bpm_classic, bpm_tiny, list(trace_buffer), sample_frames
 
 # Main UI
-st.title("❤️ Live Pulse Rate Monitor")
-st.markdown("### Real-time Heart Rate Detection using rPPG Technology")
+st.title("❤️ Pulse Rate Monitor")
+st.markdown("### Heart Rate Detection from Video using rPPG Technology")
 
 # Sidebar
 with st.sidebar:
-    st.header("⚙️ Settings")
+    st.header("⚙️ About")
     st.markdown("---")
     
     st.markdown("### 📊 How it works")
     st.info("""
-    1. Click **Start Live Detection**
-    2. Position your face in the camera
-    3. Stay still for best results
-    4. Heart rate updates in real-time
-    5. Click **Stop** to end detection
+    1. **Upload** a video of your face
+    2. Algorithm detects your **forehead**
+    3. Extracts **rPPG signals**
+    4. Calculates heart rate using:
+       - Classical signal processing
+       - TinyRPPGNet deep learning
     """)
     
     st.markdown("---")
     st.markdown("### 🔬 Technology")
     st.success("""
-    - **Classical Method**: Signal processing with FFT & Welch PSD
-    - **TinyRPPGNet**: Deep learning 3D CNN model
+    - **MediaPipe**: Face detection
+    - **Classical Method**: FFT & Welch PSD
+    - **TinyRPPGNet**: 3D CNN model
     - **rPPG**: Remote photoplethysmography
-    - **Real-time**: Live webcam processing
     """)
     
     st.markdown("---")
-    st.markdown("### 💡 Tips for Best Results")
+    st.markdown("### 💡 Video Requirements")
     st.warning("""
-    - **Good lighting** is essential
-    - Keep your **face steady**
-    - Wait **5-10 seconds** for accurate reading
-    - **Avoid sudden movements**
-    - Ensure your **forehead is visible**
+    - **Duration**: 5-30 seconds
+    - **Lighting**: Good, even lighting
+    - **Position**: Face clearly visible
+    - **Movement**: Keep face still
+    - **Focus**: Forehead visible
+    - **Format**: MP4, AVI, MOV, MKV
     """)
     
     st.markdown("---")
-    st.markdown("### 📋 Normal Heart Rate Ranges")
+    st.markdown("### 📋 Normal Heart Rate")
     st.info("""
     - **Resting**: 60-100 BPM
     - **Athlete**: 40-60 BPM
-    - **After exercise**: 100-150 BPM
+    - **Exercise**: 100-150 BPM
     """)
 
-# Main content area
-col1, col2, col3 = st.columns([1, 2, 1])
+# Main content
+st.markdown("---")
 
-with col2:
-    st.markdown("<br>", unsafe_allow_html=True)
+# File uploader
+uploaded_file = st.file_uploader(
+    "📹 Upload a video of your face",
+    type=["mp4", "avi", "mov", "mkv", "webm"],
+    help="Upload a short video (5-30 seconds) with your face clearly visible"
+)
+
+if uploaded_file is not None:
+    # Save uploaded file to temp location
+    with tempfile.NamedTemporaryFile(delete=False, suffix=Path(uploaded_file.name).suffix) as tmp_file:
+        tmp_file.write(uploaded_file.read())
+        tmp_path = tmp_file.name
     
-    if not st.session_state.running:
-        if st.button("🎥 Start Live Detection", use_container_width=True, type="primary"):
-            st.session_state.running = True
-            st.rerun()
-    else:
-        st.info("🔴 Live detection is running...")
+    st.success(f"✅ Video uploaded: {uploaded_file.name}")
+    
+    # Show video preview
+    st.video(uploaded_file)
+    
+    # Process button
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        if st.button("🔍 Analyze Heart Rate", use_container_width=True, type="primary"):
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            
+            with st.spinner("🔄 Processing video..."):
+                bpm_classic, bpm_tiny, trace, sample_frames = process_video(
+                    tmp_path, progress_bar, status_text
+                )
+            
+            progress_bar.empty()
+            status_text.empty()
+            
+            # Clean up temp file
+            try:
+                Path(tmp_path).unlink()
+            except:
+                pass
+            
+            if bpm_classic is not None or bpm_tiny is not None:
+                st.success("✅ Analysis completed!")
+                
+                # Display results
+                st.markdown("---")
+                st.markdown("### 📈 Heart Rate Results")
+                
+                result_col1, result_col2 = st.columns(2)
+                
+                with result_col1:
+                    if np.isfinite(bpm_classic):
+                        st.metric("🔵 Classical Method", f"{bpm_classic:.1f} BPM")
+                    else:
+                        st.warning("⚠️ Classical method: No valid reading")
+                
+                with result_col2:
+                    if np.isfinite(bpm_tiny):
+                        st.metric("🟣 TinyRPPGNet", f"{bpm_tiny:.1f} BPM")
+                    else:
+                        st.warning("⚠️ TinyRPPGNet: No valid reading")
+                
+                # Show sample frames
+                if sample_frames:
+                    st.markdown("---")
+                    st.markdown("### 🖼️ Sample Frames with Detection")
+                    cols = st.columns(min(len(sample_frames), 4))
+                    for idx, frame in enumerate(sample_frames[:4]):
+                        with cols[idx]:
+                            st.image(frame, channels="BGR", use_container_width=True)
+                
+                # Show signal plot
+                if trace and len(trace) > 0:
+                    st.markdown("---")
+                    st.markdown("### 📊 rPPG Signal Trace")
+                    import matplotlib.pyplot as plt
+                    
+                    fig, ax = plt.subplots(figsize=(12, 4))
+                    trace_array = np.array(trace)
+                    trace_norm = (trace_array - np.mean(trace_array)) / (np.std(trace_array) + 1e-9)
+                    ax.plot(trace_norm, color='#667eea', linewidth=1.5)
+                    ax.set_xlabel("Frame", fontsize=12)
+                    ax.set_ylabel("Normalized Amplitude", fontsize=12)
+                    ax.set_title("rPPG Signal (Green Channel)", fontsize=14)
+                    ax.grid(True, alpha=0.3)
+                    st.pyplot(fig)
+                    plt.close()
+                
+                # Health interpretation
+                st.markdown("---")
+                st.markdown("### 💡 Interpretation")
+                
+                avg_bpm = np.nanmean([
+                    bpm_classic if np.isfinite(bpm_classic) else np.nan,
+                    bpm_tiny if np.isfinite(bpm_tiny) else np.nan
+                ])
+                
+                if np.isfinite(avg_bpm):
+                    if 60 <= avg_bpm <= 100:
+                        st.success(f"✅ **Normal resting heart rate**: {avg_bpm:.1f} BPM")
+                    elif 100 < avg_bpm <= 120:
+                        st.warning(f"⚠️ **Elevated heart rate**: {avg_bpm:.1f} BPM")
+                    elif avg_bpm > 120:
+                        st.error(f"🚨 **High heart rate**: {avg_bpm:.1f} BPM")
+                    else:
+                        st.info(f"💙 **Low heart rate**: {avg_bpm:.1f} BPM (May be normal for athletes)")
+                else:
+                    st.error("❌ Could not detect a valid heart rate. Please ensure:")
+                    st.markdown("""
+                    - Video has good lighting
+                    - Your face is clearly visible
+                    - You remain relatively still
+                    - Video is at least 5 seconds long
+                    """)
+            else:
+                st.error("❌ Analysis failed. Please try again with a different video.")
 
-# Run live detection if active
-if st.session_state.running:
-    run_live_detection()
+else:
+    # Show instructions when no file uploaded
+    st.info("""
+    👆 **Upload a video to get started!**
+    
+    📱 **How to record a good video:**
+    1. Find a well-lit area
+    2. Position camera to show your face clearly
+    3. Keep still for 10-15 seconds
+    4. Ensure your forehead is visible
+    5. Upload the video above
+    """)
 
 # Footer
 st.markdown("---")
